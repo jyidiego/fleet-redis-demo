@@ -9,6 +9,7 @@ import socket
 import string
 import json
 import os
+import pprint
 import re
 import threading
 
@@ -42,6 +43,7 @@ class DockerSocket(threading.Thread):
             if re.search('^\{.*\}', line): # will find all events
                 try:
                     event_dict = json.loads(line.strip())
+                    pprint.pprint("{0}".format(event_dict))
 
                     if event_dict['status'] == 'destroy':
                         event = self.events_store.pop(event_dict['id'])
@@ -71,13 +73,16 @@ class Event(object):
         self.client = docker_client
         self.container_info = self.client.inspect_container(event['id']) 
 
-    def get_status(self):
+    @property
+    def status(self):
         return self.event['status']
 
-    def get_id(self):
+    @property
+    def id(self):
         return self.event['id']
 
-    def get_location(self):
+    @property
+    def location(self):
         for env_variable in self.container_info['Config']['Env']:
             if re.search('ETCD_SERVICES', env_variable):
                 return os.path.join('/services', \
@@ -85,7 +90,8 @@ class Event(object):
                                 string.lstrip( self.container_info['Name'], '/'))
         return '/services'
 
-    def get_node(self):
+    @property
+    def node(self):
         return self.container_info['HostConfig']['PortBindings']
         
 
@@ -110,11 +116,11 @@ class EventWatcher(object):
         return self.event_map.pop( event_status )
 
     def event_action(self, event):
-        if event.get_status() in self.event_map:
-            # event_map[event.get_status()] should refer to a method to execute
+        if event.status in self.event_map:
+            # event_map[event.status] should refer to a method to execute
             # also use the event as an argument
-            print "DEBUG: {0}".format(event.get_status())
-            self.event_map[event.get_status()](event.location, event.node)
+            print "DEBUG: {0}".format(event.status)
+            self.event_map[event.status](event.location, json.dumps(event.node))
 
 
 class Register(object):
@@ -126,9 +132,11 @@ class Register(object):
         self.client = registry_client
 
     def publish( self, location, node ):
-        print "publish registry"
-        self.client.node.set(location, node)
+        print "publish entry"
+        return self.client.write(location, node)
 
     def delete( self, location, node ):
-        print "delete entry registry"
+        print "delete entry"
+        return self.client.delete(location)
+        
 
