@@ -7,10 +7,12 @@ import docker
 import etcd
 import socket
 import string
+import sys
 import json
 import os
 import pprint
 import re
+import time
 import threading
 
 
@@ -22,7 +24,7 @@ class DockerSocket(threading.Thread):
 
     def __init__(self, url, call_back):
         super(DockerSocket, self).__init__()
-        self.events_store = {}
+        # self.events_store = {}
         self.call_back = call_back
         self.docker_client = docker.Client(url)
         if re.search(r'unix://', url):
@@ -31,13 +33,16 @@ class DockerSocket(threading.Thread):
             s.connect( socket_file_path )
             s.send("GET /events HTTP/1.1\n\n")
             self.file_interface = s.makefile()
+        else:
+            print "Only support Unix Domain Sockets currently."
+            sys.exit(0) 
 
     def run(self):
         while ( True ):
             line = self.file_interface.readline()
             
             #
-            # Will find all events need to be able cache some of the events because
+            # Will find all events need to be stored because
             # they could be also events that deleted the information
             #
             if re.search('^\{.*\}', line): # will find all events
@@ -45,13 +50,13 @@ class DockerSocket(threading.Thread):
                     event_dict = json.loads(line.strip())
                     pprint.pprint("{0}".format(event_dict))
 
-                    if event_dict['status'] == 'destroy':
-                        event = self.events_store.pop(event_dict['id'])
-                    elif event_dict['status'] == 'create':
-                        event = Event( event_dict, self.docker_client )
-                        self.events_store[event_dict['id']] = event
-                    else:
-                        event = Event( event_dict, self.docker_client )
+                    #if event_dict['status'] == 'destroy':
+                    #    event = self.events_store.pop(event_dict['id'])
+                    #elif event_dict['status'] == 'create':
+                    #    event = Event( event_dict, self.docker_client )
+                    #    self.events_store[event_dict['id']] = event
+                    #else:
+                    event = Event( event_dict, self.docker_client )
 
                     self.call_back(event)
                 except docker.APIError, e:
@@ -60,12 +65,19 @@ class DockerSocket(threading.Thread):
                 except KeyError, e:
                     print "KeyError: {0}".format(e)
                     continue
+                except:
+                    # Make sure we close the socket if a exception causes us to break out
+                    # of the loop
+                    print "Unexpected error:", sys.exc_info()[0]
+                    print "Closing socket..."
+                    self.s.close()
+                    raise
 
 
 class Event(object):
 
     ''' Docker specific Event object that uses docker client
-        found here: https://github.com/dsoprea/PythonEtcdClient.git
+        found here: https://github.com/jplana/python-etcd.git 
     '''
 
     def __init__(self, event, docker_client):
@@ -88,15 +100,14 @@ class Event(object):
                 return os.path.join('/services', \
                                 string.lstrip( string.split( env_variable, '=' )[1].strip(), '/'), \
                                 string.lstrip( self.container_info['Name'], '/'))
-        return '/services'
+        return ''
 
     @property
     def node(self):
         return self.container_info['HostConfig']['PortBindings']
-        
 
 
-class EventWatcher(object):
+class EventManager(object):
 
     ''' Setup event states to take action on.
 
@@ -123,20 +134,108 @@ class EventWatcher(object):
             self.event_map[event.status](event.location, json.dumps(event.node))
 
 
-class Register(object):
+class Register(threading.Thread):
 
     ''' Publishes and deletes entries in the Registry.
     '''
 
-    def __init__(self, registry_client):
+    def __init__(self, registry_client, ttl=0, refresh_dict={}):
+        super(Register, self).__init__()
+        self.refresh_dict = refresh_dict
         self.client = registry_client
+        self.ttl = ttl
 
     def publish( self, location, node ):
-        print "publish entry"
-        return self.client.write(location, node)
+        if location:
+            print "publish entry: {0}".format(location)
+            print "config info: {0}".format(node)
+            self.refresh_dict[location] = { "timer" : threading.Timer(self.ttl, self.refresh, (location, node)),
+                                            "args" : ( location, node ) }
+            self.refresh_dict[location]["timer"].start()
+            return self.client.write(location, node, self.ttl)
+        else:
+            return None
 
     def delete( self, location, node ):
-        print "delete entry"
-        return self.client.delete(location)
-        
+        if location:
+            print "delete entry: {0}".format(location)
+            t = self.refresh_dict.pop(location)
+            t["timer"].cancel() # cancel the refresh
+            return self.client.delete(location)
+        else:
+            return None
 
+    def refresh( self, location, node ):
+        if location:
+            print "refresh entry: {0}".format(location)
+            print "ttl: {0}".format(self.ttl) 
+            return self.client.write(location, node, self.ttl)
+        else:
+            return None
+
+    def run( self ):
+        while ( True ):
+            for location in self.refresh_dict:
+                if self.refresh_dict[location]["timer"].finished.is_set():
+                    self.refresh_dict[location]["timer"] = threading.Timer(   self.ttl, self.refresh, \
+                                                                    self.refresh_dict[location]["args"]   )
+                    self.refresh_dict[location]["timer"].start()
+            time.sleep(1)
+
+
+def publish_running_containers(register, base_url="unix:///tmp/docker.sock"):
+    dc = docker.Client(base_url=base_url)
+    for container in dc.containers():
+        # add some additional keys in the dict so they can
+        # be loaded as an event
+        container['id'] = container['Id']
+        container['status'] = 'up'
+        e = Event( container, dc )
+        if e.location:
+            print "location: {0}".format(e.location) 
+            print "node: {0}".format(e.node) 
+            print "register_dict: {0}".format(register.refresh_dict)
+        # register.publish( e.location, e.node )
+
+def main():
+    #
+    # create etcd client: 10.1.42.1 is the docker0 interface for
+    # all docker instances
+    #
+    etcd_client = etcd.Client(host='10.1.42.1')
+
+    #
+    # create register object
+    #
+    # register = Register(etcd_client, 60)
+    register = Register(etcd_client)
+
+    #
+    # create event manager object
+    #
+    event_manager = EventManager()
+    event_manager.add_event( { 'start' : register.publish } )
+    event_manager.add_event( { 'die' : register.delete } )
+
+    #
+    # create docker socket
+    #
+    docker_socket = DockerSocket('unix:///tmp/docker.sock', event_manager.event_action) 
+
+    #
+    # start event listening
+    #
+    docker_socket.daemon = True
+    docker_socket.start()
+
+    #
+    # refresh nodes
+    #
+    while ( True ):
+        time.sleep(10)
+        pass
+
+
+
+if __name__ == '__main__':
+    main()
