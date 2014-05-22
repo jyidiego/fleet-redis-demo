@@ -24,20 +24,30 @@ class DockerSocket(threading.Thread):
 
     def __init__(self, url, call_back):
         super(DockerSocket, self).__init__()
-        # self.events_store = {}
+        self.events_store = {}
         self.call_back = call_back
         self.docker_client = docker.Client(url)
         if re.search(r'unix://', url):
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             socket_file_path = string.replace(url, r'unix://', '')
-            s.connect( socket_file_path )
-            s.send("GET /events HTTP/1.1\n\n")
-            self.file_interface = s.makefile()
+            self.s.connect( socket_file_path )
+            self.s.send("GET /events HTTP/1.1\n\n")
+            self.file_interface = self.s.makefile()
         else:
             print "Only support Unix Domain Sockets currently."
             sys.exit(0) 
 
+    def _load_running_containers( self ):
+        for container in self.docker_client.containers():
+            # transform containers to contain keys that events
+            # have
+            container['id'] = container['Id']
+            container['status'] = 'up'
+            event = Event( container, self.docker_client ) 
+            self.events_store[container['id']] = event
+
     def run(self):
+        self._load_running_containers()
         while ( True ):
             line = self.file_interface.readline()
             
@@ -50,13 +60,13 @@ class DockerSocket(threading.Thread):
                     event_dict = json.loads(line.strip())
                     pprint.pprint("{0}".format(event_dict))
 
-                    #if event_dict['status'] == 'destroy':
-                    #    event = self.events_store.pop(event_dict['id'])
-                    #elif event_dict['status'] == 'create':
-                    #    event = Event( event_dict, self.docker_client )
-                    #    self.events_store[event_dict['id']] = event
-                    #else:
-                    event = Event( event_dict, self.docker_client )
+                    if event_dict['status'] == 'destroy':
+                        event = self.events_store.pop(event_dict['id'])
+                    elif event_dict['status'] == 'create':
+                        event = Event( event_dict, self.docker_client )
+                        self.events_store[event_dict['id']] = event
+                    else:
+                        event = Event( event_dict, self.docker_client )
 
                     self.call_back(event)
                 except docker.APIError, e:
@@ -191,11 +201,11 @@ def publish_running_containers(register, base_url="unix:///tmp/docker.sock"):
         container['id'] = container['Id']
         container['status'] = 'up'
         e = Event( container, dc )
-        if e.location:
-            print "location: {0}".format(e.location) 
-            print "node: {0}".format(e.node) 
-            print "register_dict: {0}".format(register.refresh_dict)
-        # register.publish( e.location, e.node )
+        r = register.publish( e.location, e.node )
+        if r:
+            print "Published: {0}".format(r)
+        else:
+            print "Nothing to publish"
 
 def main():
     #
@@ -207,8 +217,13 @@ def main():
     #
     # create register object
     #
-    # register = Register(etcd_client, 60)
-    register = Register(etcd_client)
+    register = Register(etcd_client, 60)
+    # register = Register(etcd_client)
+
+    #
+    # publish config info for existing containers
+    #
+    publish_running_containers( register )
 
     #
     # create event manager object
@@ -227,6 +242,12 @@ def main():
     #
     docker_socket.daemon = True
     docker_socket.start()
+
+    #
+    # start ttl refresh daemon
+    #
+    register.daemon = True
+    register.start()
 
     #
     # refresh nodes
